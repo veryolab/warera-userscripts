@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         WarEra Mercado HUD
 // @namespace    local.warera.mercado-hud
-// @version      0.3.1
+// @version      0.3.3
 // @description  Conselheiro de trading na tela do mercado: diz "vende/compra" com bid/ask, VWAP, volume e tendência (Rising/Falling/Stable…) de trades reais via daemon local (fallback API). Read-only.
 // @match        https://app.warera.io/*
 // @connect      api2.warera.io
-// @grant        none
+// @connect      127.0.0.1
+// @connect      localhost
+// @grant        GM_xmlhttpRequest
 // @run-at       document-idle
 // @updateURL    https://raw.githubusercontent.com/veryolab/warera-userscripts/main/WarEraMercadoHUD.user.js
 // @downloadURL  https://raw.githubusercontent.com/veryolab/warera-userscripts/main/WarEraMercadoHUD.user.js
@@ -72,15 +74,19 @@
     }
     throw lastErr || new Error(path);
   }
-  // lê do daemon local (fetch de página → 127.0.0.1 passa a CSP; ver CraftAdvisor). null se off.
-  async function db(path) {
-    try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 1500);
-      const res = await fetch(DAEMON + path, { signal: ctrl.signal });
-      clearTimeout(t);
-      return res.ok ? await res.json() : null;
-    } catch { return null; }
+  // lê do daemon local via GM_xmlhttpRequest — CONTORNA o CSP/mixed-content/Private-Network
+  // (o jogo é HTTPS e um fetch de página p/ http://127.0.0.1 é bloqueado pelo browser).
+  // null se o daemon estiver desligado. Na 1ª vez o Tampermonkey pede para permitir 127.0.0.1.
+  function db(path) {
+    return new Promise((resolve) => {
+      try {
+        GM_xmlhttpRequest({
+          method: "GET", url: DAEMON + path, timeout: 1500,
+          onload: (r) => { try { resolve(r.status >= 200 && r.status < 300 ? JSON.parse(r.responseText) : null); } catch { resolve(null); } },
+          onerror: () => resolve(null), ontimeout: () => resolve(null),
+        });
+      } catch { resolve(null); }
+    });
   }
   const load = (k, fb) => { try { return JSON.parse(localStorage.getItem(k)) ?? fb; } catch { return fb; } };
   const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
@@ -285,15 +291,13 @@
   color:#151a21;filter:drop-shadow(0 1px 1px #000a)}
 .wmh-tag.sell{background:#f0b13e}.wmh-tag.buy{background:#58c26e}.wmh-tag.wait{background:#e0a952}
 
-/* painel "Ações" (canto inferior direito; minimizado por defeito) */
-#wmh{position:fixed;z-index:99990;bottom:14px;right:14px;color:#dbe4ee;
-  font:12px/1.45 Inter,system-ui,Segoe UI,sans-serif;user-select:none}
-#wmh .box{background:#151a21f2;border:1px solid #2b3441;border-radius:11px;overflow:hidden;
-  box-shadow:0 8px 28px #0009;backdrop-filter:blur(6px)}
+/* painel "Ações" — INTEGRADO no topo da secção Comércio (em fluxo; rola com a página) */
+#wmh{margin:2px 0 12px;color:#dbe4ee;font:12px/1.45 Inter,system-ui,Segoe UI,sans-serif;user-select:none}
+#wmh .box{background:#151a21f2;border:1px solid #2b3441;border-radius:11px;overflow:hidden}
 #wmh .head{display:flex;align-items:center;gap:8px;padding:7px 11px;cursor:pointer;background:#1a212b}
 #wmh .head b{font-size:11px;letter-spacing:.07em;color:#f0b13e;text-transform:uppercase;flex:1}
 #wmh .btn{cursor:pointer;border:0;background:#232c38;color:#8494a8;border-radius:6px;padding:2px 7px;font-size:11px}
-#wmh .body{width:min(320px,92vw);max-height:56vh;overflow-y:auto;padding:4px 0 8px}
+#wmh .body{max-height:56vh;overflow-y:auto;padding:4px 0 8px}
 #wmh .body::-webkit-scrollbar{width:8px}#wmh .body::-webkit-scrollbar-thumb{background:#2b3441;border-radius:8px}
 #wmh h4{margin:8px 11px 2px;font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:#617083}
 #wmh .row{display:flex;align-items:center;gap:7px;padding:4px 11px}
@@ -317,6 +321,16 @@
     || el.querySelector('img[alt]')?.getAttribute("alt") || null;
   function marketTiles() {
     return [...document.querySelectorAll('[id^="item-code-selector-"]')];
+  }
+  // âncora do painel = contentor da grelha do mercado (LCA do 1º e último tile).
+  // Injetamos o painel logo ANTES dele → topo da secção Comércio, em fluxo (rola com a página).
+  function marketAnchor() {
+    const tiles = marketTiles();
+    if (tiles.length < 2) return null;
+    const up = new Set();
+    for (let n = tiles[0]; n && n !== document.body; n = n.parentElement) up.add(n);
+    for (let n = tiles[tiles.length - 1]; n && n !== document.body; n = n.parentElement) if (up.has(n)) return n;
+    return null;
   }
   function applyTiles() {
     css();
@@ -357,18 +371,19 @@
   const dealPrice = (s) => s.side === "sell" ? (s.bid ?? s.price) : (s.ask ?? s.price);
   function renderPanel() {
     css();
-    // só aparece na tela do mercado (há tiles)
-    const onMarket = marketTiles().length > 0;
+    const anchor = marketAnchor(); // contentor da grelha do mercado
     let root = document.getElementById("wmh");
-    if (!onMarket) { if (root) root.style.display = "none"; return; }
+    if (!anchor) { if (root) root.style.display = "none"; return; } // fora da tela do mercado
     if (!root) {
-      root = document.createElement("div"); root.id = "wmh"; document.body.appendChild(root);
+      root = document.createElement("div"); root.id = "wmh";
       root.addEventListener("click", (e) => {
         const id = e.target?.id;
         if (id === "wmh-min" || e.target.closest?.(".head")) { const u = load(LS.ui, {}); u.open = !u.open; save(LS.ui, u); renderPanel(); }
         else if (id === "wmh-re") { e.stopPropagation(); refresh(); }
       });
     }
+    // injeta/reancora no topo da grelha (sobrevive aos re-renders do React)
+    if (anchor.parentElement && root.nextElementSibling !== anchor) anchor.parentElement.insertBefore(root, anchor);
     root.style.display = "block";
     const ui = load(LS.ui, {}); const open = !!ui.open;
     const acts = actionList();
