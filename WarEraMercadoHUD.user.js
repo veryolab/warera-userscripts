@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WarEra Mercado HUD
 // @namespace    local.warera.mercado-hud
-// @version      0.1.0
-// @description  Conselheiro de trading DENTRO da tela do mercado: vê os teus itens + preço + tendência e diz "vende isto" / "compra que está barato". Read-only, advice-only.
+// @version      0.3.1
+// @description  Conselheiro de trading na tela do mercado: diz "vende/compra" com bid/ask, VWAP, volume e tendência (Rising/Falling/Stable…) de trades reais via daemon local (fallback API). Read-only.
 // @match        https://app.warera.io/*
 // @connect      api2.warera.io
 // @grant        none
@@ -34,6 +34,7 @@
 
   // failover de hosts (api2–api5), igual aos outros HUDs
   const HOSTS = ["https://api2.warera.io", "https://api3.warera.io", "https://api4.warera.io", "https://api5.warera.io"];
+  const DAEMON = "http://127.0.0.1:8799"; // coletor local (src/daemon.js): histórico contínuo + bid/ask
   const LS = { hist: "wmh.hist", cfg: "wmh.cfg", ui: "wmh.ui" };
   const REFRESH_MS = 5 * 60 * 1000;    // ciclo de dados (mercado mexe mais que empresas)
   const SAMPLE_MS = 30 * 60 * 1000;    // amostra de preços p/ histórico
@@ -71,6 +72,16 @@
     }
     throw lastErr || new Error(path);
   }
+  // lê do daemon local (fetch de página → 127.0.0.1 passa a CSP; ver CraftAdvisor). null se off.
+  async function db(path) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 1500);
+      const res = await fetch(DAEMON + path, { signal: ctrl.signal });
+      clearTimeout(t);
+      return res.ok ? await res.json() : null;
+    } catch { return null; }
+  }
   const load = (k, fb) => { try { return JSON.parse(localStorage.getItem(k)) ?? fb; } catch { return fb; } };
   const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
@@ -81,7 +92,9 @@
     prices: {}, inv: {},
     produce: new Set(),        // itemCodes que produzo (empresas ativas ou não)
     inputs: new Map(),         // input code -> [itemCodes que o consomem]
-    sig: {},                   // code -> {side, price, t, pctile, action, why[], marginPP}
+    sig: {},                   // code -> {side, price, bid, ask, t, pctile, action, why[], marginPP}
+    dstats: null,              // code -> stats do daemon (trendPct/pctile/bid/ask) ou null (fallback local)
+    src: "local",              // "daemon" | "local"
     hist: load(LS.hist, []),
     err: null, at: 0, busy: false,
   };
@@ -152,21 +165,40 @@
       const held = (S.inv[code] || 0) > 0;
       const isInput = S.inputs.has(code) && !produce; // se produzo, o lado é vender
       const side = produce || held ? "sell" : isInput ? "buy" : null;
-      const t = trend(code), pctile = rangePct(code);
+      const ds = S.dstats?.[code]; // stats do daemon (se ligado)
+      const t = ds ? ds.trendPct : trend(code);
+      // "barato/caro" = posição no intervalo: prefere 30D (near-30D-low/high, sinal mais forte);
+      // senão 7D do daemon; senão o histórico local. 0 = perto do mínimo (barato), 1 = do máximo (caro).
+      const pctile = ds ? (ds.d30?.pctile ?? ds.pctile) : rangePct(code);
+      const bid = ds?.bid ?? null, ask = ds?.ask ?? null;
+      const labels = ds?.labels || [];
+      // momentum: dos labels do daemon; em fallback local, derivado da tendência
+      const rising = labels.includes("Rising") || (!ds && t != null && t > 2);
+      const falling = labels.includes("Falling") || (!ds && t != null && t < -2);
+      const thin = labels.includes("Thin"), volatile = labels.includes("Volatile");
+      const pctS = (x) => Math.round(x * 100) + "%";
       const why = [];
       let action = false, wait = false;
-      if (side === "sell") {
-        if (pctile != null && pctile >= 0.65) { action = true; why.push(`preço no topo do intervalo (${Math.round(pctile * 100)}%)`); }
-        if (t != null && t > 2) { action = true; why.push(`a subir +${t.toFixed(0)}%`); }
-        if (t != null && t < -3) { wait = true; why.push(`a cair ${t.toFixed(0)}% — talvez esperar`); }
-        if (pctile != null && pctile <= 0.2 && !action) { wait = true; why.push(`perto do fundo (${Math.round(pctile * 100)}%) — mau momento p/ vender`); }
-      } else if (side === "buy") {
-        if (pctile != null && pctile <= 0.35) { action = true; why.push(`preço no fundo do intervalo (${Math.round(pctile * 100)}%)`); }
-        if (t != null && t < -2) { action = true; why.push(`a cair ${t.toFixed(0)}%`); }
-        if (pctile != null && pctile >= 0.8) { wait = true; why.push(`perto do topo (${Math.round(pctile * 100)}%) — caro p/ comprar`); }
+      // O NÍVEL (pctile) decide se o preço está bom; a DIREÇÃO (rising/falling) afina o timing.
+      if (side === "sell") {            // produzes/tens → vender caro
+        if (pctile != null && pctile >= 0.7) { action = true; why.push(`perto do máximo (${pctS(pctile)})${rising ? " e a subir" : ""} — bom p/ vender`); }
+        else if (rising && pctile != null && pctile >= 0.45) { action = true; why.push(`a subir (Rising) para bom nível (${pctS(pctile)})`); }
+        else if (falling && pctile != null && pctile < 0.5) { wait = true; why.push(`a cair (Falling) de nível médio — segura`); }
+        else if (pctile != null && pctile <= 0.3) { wait = true; why.push(`perto do mínimo (${pctS(pctile)}) — mau momento p/ vender`); }
+      } else if (side === "buy") {       // input teu → comprar barato
+        if (pctile != null && pctile <= 0.3) { action = true; why.push(`perto do mínimo (${pctS(pctile)})${falling ? " e a cair" : ""} — bom p/ comprar`); }
+        else if (falling && pctile != null && pctile <= 0.55) { action = true; why.push(`a cair (Falling) — apanha a queda (${pctS(pctile)})`); }
+        else if (rising && pctile != null && pctile > 0.5) { wait = true; why.push(`a subir (Rising) e caro (${pctS(pctile)}) — espera`); }
+        else if (pctile != null && pctile >= 0.7) { wait = true; why.push(`perto do máximo (${pctS(pctile)}) — caro p/ comprar`); }
       }
+      // mercado fino = poucas trades → sinal pouco fiável; não dar recomendação forte
+      if (thin && (action || wait)) { action = false; wait = false; why.unshift(`⚠ mercado fino — sinal pouco fiável`); }
+      if (volatile) why.push(`volátil`);
       S.sig[code] = {
-        side, price, t, pctile, action, wait, why,
+        side, price, bid, ask, buyQty: ds?.buyQty ?? null, sellQty: ds?.sellQty ?? null,
+        t, pctile, action, wait, why,
+        labels, vwap: ds?.vwap7 ?? null, trades7: ds?.trades7 ?? null, volume7: ds?.volume7 ?? null,
+        spreadPct: ds?.spreadPct ?? null, depthImb: ds?.depthImbalancePct ?? null, d30: ds?.d30 || null,
         held: S.inv[code] || 0, produce, marginPP: produce ? marginPP(code) : null,
         consumers: S.inputs.get(code) || null,
       };
@@ -178,34 +210,41 @@
     if (S.busy) return;
     S.busy = true;
     try {
+      // SESSÃO (sempre do browser — o daemon não vê inventário/cash): quem sou + stock
       const me = await trpc("user.getMe", {});
       S.userId = me?._id;
-      const [user, inv, prices] = await Promise.all([
-        trpc("user.getUserById", { userId: S.userId }).catch(() => null),
-        trpc("inventory.getMyInventory", {}).catch(() => null),
-        trpc("itemTrading.getPrices", {}),
-      ]);
-      S.prices = prices || {};
+      const inv = await trpc("inventory.getMyInventory", {}).catch(() => null);
       S.inv = inv?.items?.basics || {};
-
+      // config (cache local 24h; preciso das recipes p/ a margem)
       let cfg = load(LS.cfg, null);
       if (!cfg || !cfg.items || Date.now() - cfg.at > 24 * 3.6e6) { cfg = trimConfig(await trpc("gameConfig.getGameConfig", {})); save(LS.cfg, cfg); }
       S.cfg = cfg;
 
-      // o que PRODUZO + os INPUTS disso (p/ saber lado de cada item)
-      S.produce = new Set(); S.inputs = new Map();
-      const listRes = await trpc("company.getCompanies", { userId: S.userId, perPage: 100 }).catch(() => null);
-      const ids = (listRes?.items || listRes || []).map((x) => (typeof x === "string" ? x : x._id));
-      const comps = (await Promise.all(ids.map((id) => trpc("company.getById", { companyId: id }).catch(() => null)))).filter(Boolean);
-      for (const c of comps) {
-        if (!c.itemCode) continue;
-        S.produce.add(c.itemCode);
-        for (const m of Object.keys(S.cfg.items[c.itemCode]?.needs || {})) {
-          const arr = S.inputs.get(m) || []; if (!arr.includes(c.itemCode)) arr.push(c.itemCode); S.inputs.set(m, arr);
+      // FONTE dos dados de mercado: DAEMON primeiro (histórico contínuo + bid/ask), senão API viva
+      const mkt = await db("/market");
+      if (mkt && mkt.items) {
+        S.src = "daemon"; S.dstats = mkt.items;
+        S.prices = {}; for (const [c, it] of Object.entries(mkt.items)) S.prices[c] = it.price;
+        S.produce = new Set(mkt.mine?.produce || []);
+        S.inputs = new Map(Object.entries(mkt.mine?.inputs || {}));
+      } else {
+        S.src = "local"; S.dstats = null;
+        S.prices = (await trpc("itemTrading.getPrices", {})) || {};
+        // o que PRODUZO + inputs (fallback: empresas via API pública)
+        S.produce = new Set(); S.inputs = new Map();
+        const listRes = await trpc("company.getCompanies", { userId: S.userId, perPage: 100 }).catch(() => null);
+        const ids = (listRes?.items || listRes || []).map((x) => (typeof x === "string" ? x : x._id));
+        const comps = (await Promise.all(ids.map((id) => trpc("company.getById", { companyId: id }).catch(() => null)))).filter(Boolean);
+        for (const c of comps) {
+          if (!c.itemCode) continue;
+          S.produce.add(c.itemCode);
+          for (const m of Object.keys(S.cfg.items[c.itemCode]?.needs || {})) {
+            const arr = S.inputs.get(m) || []; if (!arr.includes(c.itemCode)) arr.push(c.itemCode); S.inputs.set(m, arr);
+          }
         }
       }
 
-      samplePrices();
+      samplePrices();     // mantém histórico local como BACKUP (se o daemon cair, os sinais sobrevivem)
       computeSignals();
       S.err = null; S.at = Date.now();
     } catch (e) {
@@ -314,6 +353,8 @@
     if (s.side === "sell") return s.action ? "VENDER" : s.wait ? "segurar" : "vender?";
     return s.action ? "COMPRAR" : s.wait ? "esperar" : "comprar?";
   }
+  // preço real do negócio: a vender recebes o BID; a comprar pagas o ASK (fallback: preço médio)
+  const dealPrice = (s) => s.side === "sell" ? (s.bid ?? s.price) : (s.ask ?? s.price);
   function renderPanel() {
     css();
     // só aparece na tela do mercado (há tiles)
@@ -334,7 +375,7 @@
     const doNow = acts.filter((s) => s.action);
     const line = (s) => `<div class="row">
         <span class="nm">${itemIcon(s.code)} <span class="${s.side === "sell" ? "wmh-sellc" : "wmh-buyc"}">${verb(s)}</span> <span class="wmh-dim">${esc(s.code)}</span></span>
-        <span>${coins(s.price, 3)}</span>${s.t != null ? (s.t > 1.5 ? `<span class="wmh-up">↗</span>` : s.t < -1.5 ? `<span class="wmh-down">↘</span>` : `<span class="wmh-flat">→</span>`) : ""}
+        <span>${coins(dealPrice(s), 3)}</span>${s.t != null ? (s.t > 1.5 ? `<span class="wmh-up">↗</span>` : s.t < -1.5 ? `<span class="wmh-down">↘</span>` : `<span class="wmh-flat">→</span>`) : ""}
       </div>${s.why.length ? `<div class="row" style="padding-top:0"><span class="why">↳ ${esc(s.why[0])}</span></div>` : ""}`;
     root.innerHTML = `
       <div class="box">
@@ -349,7 +390,7 @@
           ${S.err ? `<div class="err">⚠ ${esc(S.err)}</div>` : ""}
           ${doNow.length ? `<h4>Fazer agora</h4>${doNow.map(line).join("")}` : `<div class="row wmh-dim">sem jogadas óbvias agora</div>`}
           ${acts.some((s) => s.wait) ? `<h4>Esperar</h4>${acts.filter((s) => s.wait).map(line).join("")}` : ""}
-          <div class="foot">🟡 vender · 🟢 comprar · anel no tile · read-only · ${S.at ? new Date(S.at).toLocaleTimeString("pt-PT") : "…"} · ${S.hist.length} amostras</div>
+          <div class="foot">🟡 vender · 🟢 comprar · fonte: ${S.src === "daemon" ? "daemon ✓ (bid/ask + histórico)" : "API (daemon off)"} · ${S.at ? new Date(S.at).toLocaleTimeString("pt-PT") : "…"} · ${S.hist.length} amostras locais</div>
         </div>`}
       </div>`;
   }
@@ -360,6 +401,15 @@
     const L = [];
     const head = s.side === "sell" ? `<span class="wmh-sellc">${verb(s)} ${esc(code)}</span>` : s.side === "buy" ? `<span class="wmh-buyc">${verb(s)} ${esc(code)}</span>` : esc(code);
     L.push(`<div><b>${head}</b> · ${coins(s.price, 3)} <span class="wmh-dim">mercado</span></div>`);
+    if (s.bid != null || s.ask != null) {
+      const spread = (s.bid && s.ask) ? ((s.ask - s.bid) / s.ask * 100) : null;
+      L.push(`<div>${s.bid != null ? `vende ao bid <b class="wmh-sellc">${num(s.bid, 3)}</b>` : ""}${s.bid != null && s.ask != null ? " · " : ""}${s.ask != null ? `compra ao ask <b class="wmh-buyc">${num(s.ask, 3)}</b>` : ""}${spread != null ? ` <span class="wmh-dim">(spread ${spread.toFixed(1)}%)</span>` : ""}</div>`);
+      if (s.buyQty != null || s.sellQty != null) L.push(`<div class="wmh-dim">profundidade: ${Number(s.buyQty || 0).toLocaleString()} compra / ${Number(s.sellQty || 0).toLocaleString()} venda</div>`);
+    }
+    // detalhe do daemon (trades reais): labels de tendência + estatísticas de janela
+    if (s.labels.length) L.push(`<div>tendência 7D: <b>${s.labels.map(esc).join(" · ")}</b>${s.depthImb != null ? ` <span class="wmh-dim">· livro ${s.depthImb > 0 ? "+" : ""}${Math.round(s.depthImb)}% ${s.depthImb > 0 ? "compra" : "venda"}</span>` : ""}</div>`);
+    if (s.trades7) L.push(`<div class="wmh-dim">7D: ${s.trades7} trades · vol ${Number(s.volume7 || 0).toLocaleString()}${s.vwap != null ? ` · VWAP ${num(s.vwap, 3)}` : ""}</div>`);
+    if (s.d30 && s.d30.low != null) L.push(`<div class="wmh-dim">30D: ${num(s.d30.low, 3)}–${num(s.d30.high, 3)}${s.d30.pctile != null ? ` · agora ${Math.round(s.d30.pctile * 100)}% (0=barato, 100=caro)` : ""}</div>`);
     if (s.produce) L.push(`<div class="wmh-dim">produzes isto${s.marginPP != null ? ` · margem ${num(s.marginPP, 3)}/pp` : ""}</div>`);
     if (s.held) L.push(`<div class="wmh-dim">tens ${Number(s.held).toLocaleString()} em stock</div>`);
     if (s.consumers) L.push(`<div class="wmh-dim">input de: ${s.consumers.map(esc).join(", ")}</div>`);
