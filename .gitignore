@@ -1,0 +1,13 @@
+# Repo PÚBLICO 'warera-userscripts': APENAS os .user.js.
+# Ignora TUDO por defeito e só deixa passar os userscripts + este ficheiro.
+# Assim README.md (do bot), .warera_token, data/, src/, overview.md e capturas
+# NUNCA vão para a net por engano.
+*
+!.gitignore
+!*.user.js
+
+# reforço explícito de que segredos ficam sempre de fora
+.warera_token
+.env
+data/
+node_modules/
