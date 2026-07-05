@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WarEra Mercado HUD
 // @namespace    local.warera.mercado-hud
-// @version      0.3.3
+// @version      0.5.0
 // @description  Conselheiro de trading na tela do mercado: diz "vende/compra" com bid/ask, VWAP, volume e tendência (Rising/Falling/Stable…) de trades reais via daemon local (fallback API). Read-only.
 // @match        https://app.warera.io/*
 // @connect      api2.warera.io
@@ -100,6 +100,7 @@
     inputs: new Map(),         // input code -> [itemCodes que o consomem]
     sig: {},                   // code -> {side, price, bid, ask, t, pctile, action, why[], marginPP}
     dstats: null,              // code -> stats do daemon (trendPct/pctile/bid/ask) ou null (fallback local)
+    dsamples: null,            // {tx, px} do daemon (volume real acumulado)
     src: "local",              // "daemon" | "local"
     hist: load(LS.hist, []),
     err: null, at: 0, busy: false,
@@ -122,6 +123,21 @@
     if (!it || !it.pp || ic == null) return null;
     return ((S.prices[code] || 0) - ic) / it.pp;
   };
+  // caixas — abrir vs vender. O gear não é vendável (só craftável), por isso "valor de abrir" ≈
+  // Σ odds × custo-de-craft da raridade (o que pouparias em scraps+steel). Odds/custos: overview §4.
+  const CASE_ODDS = {
+    case1: { common: 0.62, uncommon: 0.30, rare: 0.071, epic: 0.0085, legendary: 0.0004, mythic: 0.0001 },
+    case2: { uncommon: 0.50, rare: 0.32, epic: 0.15, legendary: 0.025, mythic: 0.005 },
+  };
+  const CRAFT_COST = { common: [6, 1], uncommon: [18, 2], rare: [54, 4], epic: [162, 8], legendary: [486, 16], mythic: [1458, 32] }; // [scraps, steel]
+  function openEV(code) {
+    const odds = CASE_ODDS[code]; if (!odds) return null;
+    const ps = S.prices.scraps || 0, pt = S.prices.steel || 0;
+    if (!ps && !pt) return null;
+    let ev = 0;
+    for (const [rar, p] of Object.entries(odds)) { const c = CRAFT_COST[rar]; if (c) ev += p * (c[0] * ps + c[1] * pt); }
+    return ev;
+  }
 
   // ---------- histórico + tendência + intervalo ----------
   function samplePrices() {
@@ -200,9 +216,22 @@
       // mercado fino = poucas trades → sinal pouco fiável; não dar recomendação forte
       if (thin && (action || wait)) { action = false; wait = false; why.unshift(`⚠ mercado fino — sinal pouco fiável`); }
       if (volatile) why.push(`volátil`);
+      // CAIXAS: abrir vs vender. openVal = valor esperado do gear ao ABRIR. Preferimos o do DAEMON
+      // (preço de MERCADO real via gameStat) e caímos p/ o craft-proxy local só se o daemon estiver off.
+      let openVal = null, openBetter = false, openMkt = false;
+      if (CASE_ODDS[code] || ds?.openVal != null) {
+        openVal = ds?.openVal ?? (CASE_ODDS[code] ? openEV(code) : null);
+        openMkt = ds?.openVal != null;
+        const sellP = bid ?? price;
+        if (openVal != null && sellP != null) {
+          openBetter = openVal > sellP;
+          if (openBetter) { action = true; wait = false; why.unshift(`abrir ≈ ${num(openVal, 2)} > vender ${num(sellP, 2)} — ABRE`); }
+          else why.push(`abrir ≈ ${num(openVal, 2)} ≤ vender ${num(sellP, 2)}`);
+        }
+      }
       S.sig[code] = {
         side, price, bid, ask, buyQty: ds?.buyQty ?? null, sellQty: ds?.sellQty ?? null,
-        t, pctile, action, wait, why,
+        t, pctile, action, wait, why, openVal, openBetter, openMkt,
         labels, vwap: ds?.vwap7 ?? null, trades7: ds?.trades7 ?? null, volume7: ds?.volume7 ?? null,
         spreadPct: ds?.spreadPct ?? null, depthImb: ds?.depthImbalancePct ?? null, d30: ds?.d30 || null,
         held: S.inv[code] || 0, produce, marginPP: produce ? marginPP(code) : null,
@@ -229,12 +258,12 @@
       // FONTE dos dados de mercado: DAEMON primeiro (histórico contínuo + bid/ask), senão API viva
       const mkt = await db("/market");
       if (mkt && mkt.items) {
-        S.src = "daemon"; S.dstats = mkt.items;
+        S.src = "daemon"; S.dstats = mkt.items; S.dsamples = mkt.samples || null;
         S.prices = {}; for (const [c, it] of Object.entries(mkt.items)) S.prices[c] = it.price;
         S.produce = new Set(mkt.mine?.produce || []);
         S.inputs = new Map(Object.entries(mkt.mine?.inputs || {}));
       } else {
-        S.src = "local"; S.dstats = null;
+        S.src = "local"; S.dstats = null; S.dsamples = null;
         S.prices = (await trpc("itemTrading.getPrices", {})) || {};
         // o que PRODUZO + inputs (fallback: empresas via API pública)
         S.produce = new Set(); S.inputs = new Map();
@@ -263,6 +292,7 @@
   // ---------- helpers de UI ----------
   const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
   const num = (n, d = 2) => Number(n || 0).toFixed(d);
+  const fmtN = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "K" : String(Math.round(n || 0));
   const coins = (n, d = 2, cls = "wmh-gold") => `<span class="${cls}">${COIN}${num(n, d)}</span>`;
   const itemIcon = (code) => `<img class="wmh-item" src="/images/items/${encodeURIComponent(code)}.png?v=33" alt="${esc(code)}">`;
 
@@ -364,11 +394,12 @@
     return arr;
   }
   function verb(s) {
+    if (s.openBetter) return "ABRIR";
     if (s.side === "sell") return s.action ? "VENDER" : s.wait ? "segurar" : "vender?";
     return s.action ? "COMPRAR" : s.wait ? "esperar" : "comprar?";
   }
-  // preço real do negócio: a vender recebes o BID; a comprar pagas o ASK (fallback: preço médio)
-  const dealPrice = (s) => s.side === "sell" ? (s.bid ?? s.price) : (s.ask ?? s.price);
+  // preço mostrado: caixa a abrir → valor de abrir; a vender → BID; a comprar → ASK (fallback: preço médio)
+  const dealPrice = (s) => s.openBetter ? s.openVal : s.side === "sell" ? (s.bid ?? s.price) : (s.ask ?? s.price);
   function renderPanel() {
     css();
     const anchor = marketAnchor(); // contentor da grelha do mercado
@@ -405,7 +436,7 @@
           ${S.err ? `<div class="err">⚠ ${esc(S.err)}</div>` : ""}
           ${doNow.length ? `<h4>Fazer agora</h4>${doNow.map(line).join("")}` : `<div class="row wmh-dim">sem jogadas óbvias agora</div>`}
           ${acts.some((s) => s.wait) ? `<h4>Esperar</h4>${acts.filter((s) => s.wait).map(line).join("")}` : ""}
-          <div class="foot">🟡 vender · 🟢 comprar · fonte: ${S.src === "daemon" ? "daemon ✓ (bid/ask + histórico)" : "API (daemon off)"} · ${S.at ? new Date(S.at).toLocaleTimeString("pt-PT") : "…"} · ${S.hist.length} amostras locais</div>
+          <div class="foot">🟡 vender · 🟢 comprar · fonte: ${S.src === "daemon" ? `daemon ✓ · ${fmtN(S.dsamples?.tx || 0)} trades` : `API (daemon off) · ${S.hist.length} amostras locais`} · ${S.at ? new Date(S.at).toLocaleTimeString("pt-PT") : "…"}</div>
         </div>`}
       </div>`;
   }
@@ -416,6 +447,7 @@
     const L = [];
     const head = s.side === "sell" ? `<span class="wmh-sellc">${verb(s)} ${esc(code)}</span>` : s.side === "buy" ? `<span class="wmh-buyc">${verb(s)} ${esc(code)}</span>` : esc(code);
     L.push(`<div><b>${head}</b> · ${coins(s.price, 3)} <span class="wmh-dim">mercado</span></div>`);
+    if (s.openVal != null) L.push(`<div>🎁 abrir ≈ ${coins(s.openVal, 2)} <span class="wmh-dim">(gear a ${s.openMkt ? "preço de mercado" : "preço de craft — estimativa"})</span> · vender ≈ ${coins(s.bid ?? s.price, 2)} → <b>${s.openBetter ? "ABRIR" : "VENDER"}</b></div>`);
     if (s.bid != null || s.ask != null) {
       const spread = (s.bid && s.ask) ? ((s.ask - s.bid) / s.ask * 100) : null;
       L.push(`<div>${s.bid != null ? `vende ao bid <b class="wmh-sellc">${num(s.bid, 3)}</b>` : ""}${s.bid != null && s.ask != null ? " · " : ""}${s.ask != null ? `compra ao ask <b class="wmh-buyc">${num(s.ask, 3)}</b>` : ""}${spread != null ? ` <span class="wmh-dim">(spread ${spread.toFixed(1)}%)</span>` : ""}</div>`);
