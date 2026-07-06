@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WarEra Mercado HUD
 // @namespace    local.warera.mercado-hud
-// @version      0.5.0
+// @version      0.6.0
 // @description  Conselheiro de trading na tela do mercado: diz "vende/compra" com bid/ask, VWAP, volume e tendência (Rising/Falling/Stable…) de trades reais via daemon local (fallback API). Read-only.
 // @match        https://app.warera.io/*
 // @connect      api2.warera.io
@@ -123,21 +123,8 @@
     if (!it || !it.pp || ic == null) return null;
     return ((S.prices[code] || 0) - ic) / it.pp;
   };
-  // caixas — abrir vs vender. O gear não é vendável (só craftável), por isso "valor de abrir" ≈
-  // Σ odds × custo-de-craft da raridade (o que pouparias em scraps+steel). Odds/custos: overview §4.
-  const CASE_ODDS = {
-    case1: { common: 0.62, uncommon: 0.30, rare: 0.071, epic: 0.0085, legendary: 0.0004, mythic: 0.0001 },
-    case2: { uncommon: 0.50, rare: 0.32, epic: 0.15, legendary: 0.025, mythic: 0.005 },
-  };
-  const CRAFT_COST = { common: [6, 1], uncommon: [18, 2], rare: [54, 4], epic: [162, 8], legendary: [486, 16], mythic: [1458, 32] }; // [scraps, steel]
-  function openEV(code) {
-    const odds = CASE_ODDS[code]; if (!odds) return null;
-    const ps = S.prices.scraps || 0, pt = S.prices.steel || 0;
-    if (!ps && !pt) return null;
-    let ev = 0;
-    for (const [rar, p] of Object.entries(odds)) { const c = CRAFT_COST[rar]; if (c) ev += p * (c[0] * ps + c[1] * pt); }
-    return ev;
-  }
+  // (a lógica de caixas abrir-vs-vender e o VEREDITO vivem agora no DAEMON — o cérebro único.
+  //  O HUD só renderiza; ver localVerdict abaixo para o fallback quando o daemon está off.)
 
   // ---------- histórico + tendência + intervalo ----------
   function samplePrices() {
@@ -178,6 +165,26 @@
   }
 
   // ---------- sinal por item ----------
+  // O VEREDITO (decidir VENDER/COMPRAR/ABRIR/esperar) vive no DAEMON — cérebro único. Aqui só:
+  //  (1) determinamos o LADO (precisa do teu inventário, que é de sessão); (2) buscamos o veredito
+  //  do daemon; (3) fallback local mínimo quando o daemon está off.
+  function localVerdict(code, side) { // fallback: histórico local, sem labels/caixas
+    const near = rangePct(code), t = trend(code);
+    const falling = t != null && t < -2;
+    const pc = (x) => Math.round(x * 100) + "%";
+    const why = []; let action = false, wait = false;
+    if (side === "sell") {
+      if (near != null && near >= 0.7) { action = true; why.push(`perto do máximo (${pc(near)})`); }
+      else if (falling && near != null && near < 0.5) { wait = true; why.push(`a cair — segura`); }
+      else if (near != null && near <= 0.3) { wait = true; why.push(`perto do mínimo — mau p/ vender`); }
+    } else {
+      if (near != null && near <= 0.3) { action = true; why.push(`perto do mínimo (${pc(near)})`); }
+      else if (falling && near != null && near <= 0.55) { action = true; why.push(`a cair — apanha a queda`); }
+      else if (near != null && near >= 0.7) { wait = true; why.push(`perto do máximo — caro`); }
+    }
+    const verb = side === "sell" ? (action ? "VENDER" : wait ? "segurar" : "vender?") : (action ? "COMPRAR" : wait ? "esperar" : "comprar?");
+    return { action, wait, why, verb };
+  }
   function computeSignals() {
     S.sig = {};
     for (const code of Object.keys(S.prices)) {
@@ -187,53 +194,18 @@
       const held = (S.inv[code] || 0) > 0;
       const isInput = S.inputs.has(code) && !produce; // se produzo, o lado é vender
       const side = produce || held ? "sell" : isInput ? "buy" : null;
-      const ds = S.dstats?.[code]; // stats do daemon (se ligado)
-      const t = ds ? ds.trendPct : trend(code);
-      // "barato/caro" = posição no intervalo: prefere 30D (near-30D-low/high, sinal mais forte);
-      // senão 7D do daemon; senão o histórico local. 0 = perto do mínimo (barato), 1 = do máximo (caro).
-      const pctile = ds ? (ds.d30?.pctile ?? ds.pctile) : rangePct(code);
+      const ds = S.dstats?.[code]; // item do daemon (métricas + veredito) se ligado
+      // VEREDITO: do daemon (cérebro) quando ligado; senão fallback local mínimo
+      let v = null;
+      if (side) v = (ds && (side === "sell" ? ds.sellVerdict : ds.buyVerdict)) || localVerdict(code, side);
       const bid = ds?.bid ?? null, ask = ds?.ask ?? null;
-      const labels = ds?.labels || [];
-      // momentum: dos labels do daemon; em fallback local, derivado da tendência
-      const rising = labels.includes("Rising") || (!ds && t != null && t > 2);
-      const falling = labels.includes("Falling") || (!ds && t != null && t < -2);
-      const thin = labels.includes("Thin"), volatile = labels.includes("Volatile");
-      const pctS = (x) => Math.round(x * 100) + "%";
-      const why = [];
-      let action = false, wait = false;
-      // O NÍVEL (pctile) decide se o preço está bom; a DIREÇÃO (rising/falling) afina o timing.
-      if (side === "sell") {            // produzes/tens → vender caro
-        if (pctile != null && pctile >= 0.7) { action = true; why.push(`perto do máximo (${pctS(pctile)})${rising ? " e a subir" : ""} — bom p/ vender`); }
-        else if (rising && pctile != null && pctile >= 0.45) { action = true; why.push(`a subir (Rising) para bom nível (${pctS(pctile)})`); }
-        else if (falling && pctile != null && pctile < 0.5) { wait = true; why.push(`a cair (Falling) de nível médio — segura`); }
-        else if (pctile != null && pctile <= 0.3) { wait = true; why.push(`perto do mínimo (${pctS(pctile)}) — mau momento p/ vender`); }
-      } else if (side === "buy") {       // input teu → comprar barato
-        if (pctile != null && pctile <= 0.3) { action = true; why.push(`perto do mínimo (${pctS(pctile)})${falling ? " e a cair" : ""} — bom p/ comprar`); }
-        else if (falling && pctile != null && pctile <= 0.55) { action = true; why.push(`a cair (Falling) — apanha a queda (${pctS(pctile)})`); }
-        else if (rising && pctile != null && pctile > 0.5) { wait = true; why.push(`a subir (Rising) e caro (${pctS(pctile)}) — espera`); }
-        else if (pctile != null && pctile >= 0.7) { wait = true; why.push(`perto do máximo (${pctS(pctile)}) — caro p/ comprar`); }
-      }
-      // mercado fino = poucas trades → sinal pouco fiável; não dar recomendação forte
-      if (thin && (action || wait)) { action = false; wait = false; why.unshift(`⚠ mercado fino — sinal pouco fiável`); }
-      if (volatile) why.push(`volátil`);
-      // CAIXAS: abrir vs vender. openVal = valor esperado do gear ao ABRIR. Preferimos o do DAEMON
-      // (preço de MERCADO real via gameStat) e caímos p/ o craft-proxy local só se o daemon estiver off.
-      let openVal = null, openBetter = false, openMkt = false;
-      if (CASE_ODDS[code] || ds?.openVal != null) {
-        openVal = ds?.openVal ?? (CASE_ODDS[code] ? openEV(code) : null);
-        openMkt = ds?.openVal != null;
-        const sellP = bid ?? price;
-        if (openVal != null && sellP != null) {
-          openBetter = openVal > sellP;
-          if (openBetter) { action = true; wait = false; why.unshift(`abrir ≈ ${num(openVal, 2)} > vender ${num(sellP, 2)} — ABRE`); }
-          else why.push(`abrir ≈ ${num(openVal, 2)} ≤ vender ${num(sellP, 2)}`);
-        }
-      }
       S.sig[code] = {
         side, price, bid, ask, buyQty: ds?.buyQty ?? null, sellQty: ds?.sellQty ?? null,
-        t, pctile, action, wait, why, openVal, openBetter, openMkt,
-        labels, vwap: ds?.vwap7 ?? null, trades7: ds?.trades7 ?? null, volume7: ds?.volume7 ?? null,
+        action: v?.action || false, wait: v?.wait || false, why: v?.why || [], verb: v?.verb || null,
+        openVal: ds?.openVal ?? null, openBetter: ds?.openBetter || false, openMkt: ds?.openVal != null,
+        labels: ds?.labels || [], vwap: ds?.vwap7 ?? null, trades7: ds?.trades7 ?? null, volume7: ds?.volume7 ?? null,
         spreadPct: ds?.spreadPct ?? null, depthImb: ds?.depthImbalancePct ?? null, d30: ds?.d30 || null,
+        t: ds ? ds.trendPct : trend(code), pctile: ds ? (ds.d30?.pctile ?? ds.pctile) : rangePct(code),
         held: S.inv[code] || 0, produce, marginPP: produce ? marginPP(code) : null,
         consumers: S.inputs.get(code) || null,
       };
@@ -393,11 +365,7 @@
     arr.sort((a, b) => rank(a) - rank(b) || Math.abs(b.t || 0) - Math.abs(a.t || 0));
     return arr;
   }
-  function verb(s) {
-    if (s.openBetter) return "ABRIR";
-    if (s.side === "sell") return s.action ? "VENDER" : s.wait ? "segurar" : "vender?";
-    return s.action ? "COMPRAR" : s.wait ? "esperar" : "comprar?";
-  }
+  const verb = (s) => s.verb || (s.side === "sell" ? "vender?" : "comprar?"); // veredito vem do daemon
   // preço mostrado: caixa a abrir → valor de abrir; a vender → BID; a comprar → ASK (fallback: preço médio)
   const dealPrice = (s) => s.openBetter ? s.openVal : s.side === "sell" ? (s.bid ?? s.price) : (s.ask ?? s.price);
   function renderPanel() {
