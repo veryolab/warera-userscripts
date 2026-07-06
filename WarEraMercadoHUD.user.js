@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WarEra Mercado HUD
 // @namespace    local.warera.mercado-hud
-// @version      0.7.0
+// @version      0.8.1
 // @description  Conselheiro de trading na tela do mercado: diz "vende/compra" com bid/ask, VWAP, volume e tendência (Rising/Falling/Stable…) de trades reais via daemon local (fallback API). Read-only.
 // @match        https://app.warera.io/*
 // @connect      api2.warera.io
@@ -193,16 +193,24 @@
       const produce = S.produce.has(code);
       const held = (S.inv[code] || 0) > 0;
       const isInput = S.inputs.has(code) && !produce; // se produzo, o lado é vender
-      const side = produce || held ? "sell" : isInput ? "buy" : null;
       const ds = S.dstats?.[code]; // item do daemon (métricas + veredito) se ligado
-      // VEREDITO: do daemon (cérebro) quando ligado; senão fallback local mínimo
-      let v = null;
-      if (side) v = (ds && (side === "sell" ? ds.sellVerdict : ds.buyVerdict)) || localVerdict(code, side);
+      const cd = ds?.caseDecision; // caixas: decisão de 3 vias (comprar/abrir/guardar/vender)
+      // LADO + VEREDITO: caixas usam a árvore de 3 vias; resto usa o veredito do daemon (senão fallback)
+      let side, v = null;
+      if (cd) {
+        side = held ? "sell" : "buy";
+        v = held ? cd.held : cd.buy;
+        if (!held && (!v || v.verb === "—")) side = null; // não tens e não vale comprar → sem anel
+      } else {
+        side = produce || held ? "sell" : isInput ? "buy" : null;
+        if (side) v = (ds && (side === "sell" ? ds.sellVerdict : ds.buyVerdict)) || localVerdict(code, side);
+      }
       const bid = ds?.bid ?? null, ask = ds?.ask ?? null;
       S.sig[code] = {
         side, price, bid, ask, buyQty: ds?.buyQty ?? null, sellQty: ds?.sellQty ?? null,
         action: v?.action || false, wait: v?.wait || false, why: v?.why || [], verb: v?.verb || null,
-        openVal: ds?.openVal ?? null, openBetter: ds?.openBetter || false, openMkt: ds?.openVal != null,
+        openVal: ds?.openVal ?? null, openBetter: cd ? (v?.verb === "ABRIR") : (ds?.openBetter || false), openMkt: ds?.openVal != null,
+        caseDec: cd || null,
         sellPlan: ds?.sellPlan ?? null, buyPlan: ds?.buyPlan ?? null,
         labels: ds?.labels || [], vwap: ds?.vwap7 ?? null, trades7: ds?.trades7 ?? null, volume7: ds?.volume7 ?? null,
         spreadPct: ds?.spreadPct ?? null, depthImb: ds?.depthImbalancePct ?? null, d30: ds?.d30 || null,
@@ -382,6 +390,7 @@
   // menos a RESERVA (consumo das tuas fábricas × RESERVE_DAYS) quando o item é input teu.
   const RESERVE_DAYS = 3;
   function recQty(s) {
+    if (s.openBetter) return s.held || null; // ABRIR: abre todas as que tens (não é limitado pelo livro)
     const plan = s.side === "sell" ? s.sellPlan : s.buyPlan;
     if (!plan || !plan.qty) return null;
     if (s.side === "sell" && s.held > 0) {
@@ -439,7 +448,12 @@
     const L = [];
     const head = s.side === "sell" ? `<span class="wmh-sellc">${verb(s)} ${esc(code)}</span>` : s.side === "buy" ? `<span class="wmh-buyc">${verb(s)} ${esc(code)}</span>` : esc(code);
     L.push(`<div><b>${head}</b> · ${coins(s.price, 3)} <span class="wmh-dim">mercado</span></div>`);
-    if (s.openVal != null) L.push(`<div>🎁 abrir ≈ ${coins(s.openVal, 2)} <span class="wmh-dim">(gear a ${s.openMkt ? "preço de mercado" : "preço de craft — estimativa"})</span> · vender ≈ ${coins(s.bid ?? s.price, 2)} → <b>${s.openBetter ? "ABRIR" : "VENDER"}</b></div>`);
+    if (s.caseDec) {
+      const cd = s.caseDec;
+      L.push(`<div>🎁 abrir vale-te ${coins(cd.openWorth, 2)} <span class="wmh-dim">(gear ${coins(cd.openUse, 2)}${cd.frac < 0.99 && cd.openUse ? `, aproveitas ${Math.round((cd.openWorth / cd.openUse) * 100)}%` : ""})</span></div>`);
+      L.push(`<div class="wmh-dim">vender ${coins(s.bid ?? s.price, 2)} · comprar ${coins(s.ask ?? s.price, 2)} · nível ${s.pctile != null ? Math.round(s.pctile * 100) + "%" : "?"}</div>`);
+      L.push(`<div class="wmh-dim">se tens → <b>${cd.held.verb}</b> · se não tens → <b>${cd.buy.verb}</b> · perfil: ${esc(cd.profile)} <span title="detetado dos teus skills: combate vs economia">ⓘ</span></div>`);
+    } else if (s.openVal != null) L.push(`<div>🎁 abrir ≈ ${coins(s.openVal, 2)} · vender ≈ ${coins(s.bid ?? s.price, 2)} → <b>${s.openBetter ? "ABRIR" : "VENDER"}</b></div>`);
     if (s.bid != null || s.ask != null) {
       const spread = (s.bid && s.ask) ? ((s.ask - s.bid) / s.ask * 100) : null;
       L.push(`<div>${s.bid != null ? `vende ao bid <b class="wmh-sellc">${num(s.bid, 3)}</b>` : ""}${s.bid != null && s.ask != null ? " · " : ""}${s.ask != null ? `compra ao ask <b class="wmh-buyc">${num(s.ask, 3)}</b>` : ""}${spread != null ? ` <span class="wmh-dim">(spread ${spread.toFixed(1)}%)</span>` : ""}</div>`);
