@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WarEra Mercado HUD
 // @namespace    local.warera.mercado-hud
-// @version      0.6.0
+// @version      0.7.0
 // @description  Conselheiro de trading na tela do mercado: diz "vende/compra" com bid/ask, VWAP, volume e tendência (Rising/Falling/Stable…) de trades reais via daemon local (fallback API). Read-only.
 // @match        https://app.warera.io/*
 // @connect      api2.warera.io
@@ -203,12 +203,23 @@
         side, price, bid, ask, buyQty: ds?.buyQty ?? null, sellQty: ds?.sellQty ?? null,
         action: v?.action || false, wait: v?.wait || false, why: v?.why || [], verb: v?.verb || null,
         openVal: ds?.openVal ?? null, openBetter: ds?.openBetter || false, openMkt: ds?.openVal != null,
+        sellPlan: ds?.sellPlan ?? null, buyPlan: ds?.buyPlan ?? null,
         labels: ds?.labels || [], vwap: ds?.vwap7 ?? null, trades7: ds?.trades7 ?? null, volume7: ds?.volume7 ?? null,
         spreadPct: ds?.spreadPct ?? null, depthImb: ds?.depthImbalancePct ?? null, d30: ds?.d30 || null,
         t: ds ? ds.trendPct : trend(code), pctile: ds ? (ds.d30?.pctile ?? ds.pctile) : rangePct(code),
         held: S.inv[code] || 0, produce, marginPP: produce ? marginPP(code) : null,
         consumers: S.inputs.get(code) || null,
       };
+      // RESERVA: se este item é INPUT das tuas fábricas ativas (ex.: lead → ammo), não recomendar
+      // vender o que elas consomem — guarda ~RESERVE_DAYS de consumo. Se ficar tudo reservado, despromove.
+      const sg = S.sig[code];
+      if (sg.side === "sell" && sg.held > 0 && (S.inputNeed?.[code] || 0) > 0) {
+        sg.reserve = Math.ceil(S.inputNeed[code] * RESERVE_DAYS);
+        if (sg.reserve >= sg.held && sg.action) {
+          sg.action = false; sg.wait = true; sg.verb = "segurar";
+          sg.why.unshift(`🔒 stock todo reservado p/ as tuas fábricas (${(sg.consumers || []).join(", ")})`);
+        }
+      }
     }
   }
 
@@ -234,8 +245,9 @@
         S.prices = {}; for (const [c, it] of Object.entries(mkt.items)) S.prices[c] = it.price;
         S.produce = new Set(mkt.mine?.produce || []);
         S.inputs = new Map(Object.entries(mkt.mine?.inputs || {}));
+        S.inputNeed = mkt.mine?.inputNeed || {};   // consumo diário das TUAS fábricas → reserva
       } else {
-        S.src = "local"; S.dstats = null; S.dsamples = null;
+        S.src = "local"; S.dstats = null; S.dsamples = null; S.inputNeed = {};
         S.prices = (await trpc("itemTrading.getPrices", {})) || {};
         // o que PRODUZO + inputs (fallback: empresas via API pública)
         S.produce = new Set(); S.inputs = new Map();
@@ -366,6 +378,18 @@
     return arr;
   }
   const verb = (s) => s.verb || (s.side === "sell" ? "vender?" : "comprar?"); // veredito vem do daemon
+  // QUANTIDADE recomendada = plano do daemon (livro −2% + teto de volume) cruzado com o TEU stock,
+  // menos a RESERVA (consumo das tuas fábricas × RESERVE_DAYS) quando o item é input teu.
+  const RESERVE_DAYS = 3;
+  function recQty(s) {
+    const plan = s.side === "sell" ? s.sellPlan : s.buyPlan;
+    if (!plan || !plan.qty) return null;
+    if (s.side === "sell" && s.held > 0) {
+      const sellable = Math.max(0, s.held - (s.reserve || 0));
+      return Math.min(plan.qty, sellable);
+    }
+    return plan.qty;
+  }
   // preço mostrado: caixa a abrir → valor de abrir; a vender → BID; a comprar → ASK (fallback: preço médio)
   const dealPrice = (s) => s.openBetter ? s.openVal : s.side === "sell" ? (s.bid ?? s.price) : (s.ask ?? s.price);
   function renderPanel() {
@@ -388,7 +412,7 @@
     const acts = actionList();
     const doNow = acts.filter((s) => s.action);
     const line = (s) => `<div class="row">
-        <span class="nm">${itemIcon(s.code)} <span class="${s.side === "sell" ? "wmh-sellc" : "wmh-buyc"}">${verb(s)}</span> <span class="wmh-dim">${esc(s.code)}</span></span>
+        <span class="nm">${itemIcon(s.code)} <span class="${s.side === "sell" ? "wmh-sellc" : "wmh-buyc"}">${verb(s)}</span> ${recQty(s) != null ? `<b>${fmtN(recQty(s))}</b> ` : ""}<span class="wmh-dim">${esc(s.code)}</span></span>
         <span>${coins(dealPrice(s), 3)}</span>${s.t != null ? (s.t > 1.5 ? `<span class="wmh-up">↗</span>` : s.t < -1.5 ? `<span class="wmh-down">↘</span>` : `<span class="wmh-flat">→</span>`) : ""}
       </div>${s.why.length ? `<div class="row" style="padding-top:0"><span class="why">↳ ${esc(s.why[0])}</span></div>` : ""}`;
     root.innerHTML = `
@@ -420,6 +444,21 @@
       const spread = (s.bid && s.ask) ? ((s.ask - s.bid) / s.ask * 100) : null;
       L.push(`<div>${s.bid != null ? `vende ao bid <b class="wmh-sellc">${num(s.bid, 3)}</b>` : ""}${s.bid != null && s.ask != null ? " · " : ""}${s.ask != null ? `compra ao ask <b class="wmh-buyc">${num(s.ask, 3)}</b>` : ""}${spread != null ? ` <span class="wmh-dim">(spread ${spread.toFixed(1)}%)</span>` : ""}</div>`);
       if (s.buyQty != null || s.sellQty != null) L.push(`<div class="wmh-dim">profundidade: ${Number(s.buyQty || 0).toLocaleString()} compra / ${Number(s.sellQty || 0).toLocaleString()} venda</div>`);
+    }
+    // PLANO DE QUANTIDADE (livro −2% + teto de volume diário; instantâneo do livro = guia, não garantia)
+    const plan = s.side === "sell" ? s.sellPlan : s.buyPlan;
+    if (plan && plan.qty) {
+      const q = recQty(s);
+      if (s.side === "sell") {
+        L.push(`<div>📦 vende até <b>${fmtN(plan.qty)}</b> un sem afundar (>−${plan.slipPct}%) · média ${num(plan.avg, 3)} · receita ≈ ${coins(plan.revenue, 1)}</div>`);
+        if (s.held > 0) {
+          const rsv = s.reserve || 0;
+          L.push(`<div class="wmh-dim">tens ${Number(s.held).toLocaleString()}${rsv ? ` · 🔒 reservo ${fmtN(Math.min(rsv, s.held))} (≈${RESERVE_DAYS}d de consumo: ${(s.consumers || []).join(", ")})` : ""} → vender <b>${fmtN(q)}</b>${q <= 0 ? " (nada — tudo reservado)" : q < s.held ? "" : " (tudo)"}</div>`);
+        }
+      } else {
+        L.push(`<div>📦 compra até <b>${fmtN(plan.qty)}</b> un sem encarecer (>+${plan.slipPct}%) · média ${num(plan.avg, 3)} · custo ≈ ${coins(plan.cost, 1)}</div>`);
+      }
+      if (plan.volCap && plan.qty >= plan.volCap) L.push(`<div class="wmh-dim">limitado a ~15% do volume diário (não pressionar o mercado)</div>`);
     }
     // detalhe do daemon (trades reais): labels de tendência + estatísticas de janela
     if (s.labels.length) L.push(`<div>tendência 7D: <b>${s.labels.map(esc).join(" · ")}</b>${s.depthImb != null ? ` <span class="wmh-dim">· livro ${s.depthImb > 0 ? "+" : ""}${Math.round(s.depthImb)}% ${s.depthImb > 0 ? "compra" : "venda"}</span>` : ""}</div>`);
